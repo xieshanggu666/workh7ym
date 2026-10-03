@@ -238,6 +238,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   body TEXT NOT NULL DEFAULT '',
   task_id INTEGER NOT NULL DEFAULT 0,
   application_id INTEGER NOT NULL DEFAULT 0,
+  appointment_id INTEGER NOT NULL DEFAULT 0, -- 预约协商类通知关联的预约单（状态推进后归并失效未读）
   is_read INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT '',
   incident_id INTEGER NOT NULL DEFAULT 0,
@@ -469,6 +470,9 @@ addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'owner_name', `TEXT NOT NULL DEFAULT ''`)
 addColumn('notifications', 'owner_user_id', `TEXT NOT NULL DEFAULT ''`)
+// 预约协商通知：关联预约单，状态推进/终态时把失效的协商中未读通知归并为已读
+addColumn('notifications', 'appointment_id', `INTEGER NOT NULL DEFAULT 0`)
+db.exec(`CREATE INDEX IF NOT EXISTS idx_notifications_appt ON notifications(appointment_id, id);`)
 
 // 旧库索引迁移：正式事件改为「每个 application×stage 仅保留最新一条」（部分唯一索引）
 const evIndexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='application_events'").all().map(i => i.name)

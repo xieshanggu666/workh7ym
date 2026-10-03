@@ -322,9 +322,10 @@ export const useHrStore = defineStore('hr', {
       return this.runBusy(`appt-propose:${id}`, () =>
         this.api('POST', `/schedule/appointments/${id}/propose`, p, p.reason ? { success: '改期申请已发起，待对方确认' } : { success: '新时间已提议' }))
     },
-    rejectReschedule(id, note) {
+    rejectReschedule(id, note, party) {
       return this.runBusy(`appt-rejectrs:${id}`, () =>
-        this.api('POST', `/schedule/appointments/${id}/reject-reschedule`, { note }, { success: '已拒绝改期，维持原时间' }))
+        this.api('POST', `/schedule/appointments/${id}/reject-reschedule`,
+          { note, ...(party ? { party } : {}) }, { success: '已拒绝改期，维持原时间' }))
     },
     declineAppointment(id, reason, party) {
       return this.runBusy(`appt-decline:${id}`, () =>

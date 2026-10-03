@@ -51,7 +51,19 @@ const list = computed(() => {
 const focusTime = a => a.status === 'rescheduling' && a.pending_start ? a.pending_start : a.start_at
 const detail = computed(() => store.appointments.find(a => a.id === detailId.value) || null)
 
-function openDetail(a) { detailId.value = a.id }
+// 招聘负责人在协商操作时的「代操作方」：默认代候选人，可切换代面试官（电话确认后）
+// 确认位、留痕、通知均按该方联动，避免「代 A 操作却写成 B 的确认/通知」错配
+const actingParty = ref('candidate')
+function syncActingParty(a) {
+  // 打开待协商预约时，默认落到「还未确认」的一方，减少误操作
+  if (a && ['negotiating', 'rescheduling'].includes(a.status)) {
+    if (a.cand_confirmed && !a.int_confirmed) actingParty.value = 'interviewer'
+    else actingParty.value = 'candidate'
+  } else {
+    actingParty.value = 'candidate'
+  }
+}
+function openDetail(a) { detailId.value = a.id; syncActingParty(a) }
 function statusClass(s) {
   return { negotiating: 'pend', rescheduling: 'pend', confirmed: 'ok',
     completed: 'done', no_show: 'noshow', declined: 'dead', cancelled: 'dead' }[s] || ''
@@ -123,7 +135,7 @@ function blankPropose() {
 }
 function openPropose() {
   pf.value = blankPropose()
-  pf.value.party = store.myRole === 'interviewer' ? 'interviewer' : 'candidate'
+  pf.value.party = store.myRole === 'interviewer' ? 'interviewer' : actingParty.value
   showPropose.value = true
 }
 async function submitPropose() {
@@ -145,11 +157,20 @@ async function submitReason() {
   if (!reasonText.value.trim()) { store.notify('error', '请填写原因说明'); return }
   let r
   if (showReason.value === 'decline') {
-    r = await store.declineAppointment(detail.value.id, reasonText.value, store.myRole === 'interviewer' ? 'interviewer' : 'candidate')
+    r = await store.declineAppointment(detail.value.id, reasonText.value, actingParty.value)
   } else {
     r = await store.cancelAppointment(detail.value.id, reasonText.value)
   }
   if (r) showReason.value = null
+}
+// 拒绝改期：按当前代操作方记录并通知（原因可编辑时走弹窗，这里保留快速默认说明入口）
+const showReject = ref(false)
+const rejectText = ref('')
+function openReject() { rejectText.value = '不同意改期，维持原安排'; showReject.value = true }
+async function submitReject() {
+  if (!rejectText.value.trim()) { store.notify('error', '请填写拒绝说明'); return }
+  const r = await store.rejectReschedule(detail.value.id, rejectText.value, actingParty.value)
+  if (r) showReject.value = false
 }
 
 // ---------------- 缺席后重约 ----------------
@@ -157,7 +178,7 @@ const showRebook = ref(false)
 const rbf = ref(blankPropose())
 function openRebook() {
   rbf.value = blankPropose()
-  rbf.value.party = store.myRole === 'interviewer' ? 'interviewer' : 'candidate'
+  rbf.value.party = store.myRole === 'interviewer' ? 'interviewer' : actingParty.value
   showRebook.value = true
 }
 async function submitRebook() {
@@ -227,7 +248,7 @@ const showResume = ref(false)
 const rsf = ref(blankPropose())
 function openResume() {
   rsf.value = blankPropose()
-  rsf.value.party = store.myRole === 'interviewer' ? 'interviewer' : 'candidate'
+  rsf.value.party = store.myRole === 'interviewer' ? 'interviewer' : actingParty.value
   showResume.value = true
 }
 async function submitResume() {
@@ -471,19 +492,30 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
         </div>
 
         <!-- 操作区（按角色/状态） -->
+        <!-- 招聘负责人代操作方切换：候选人方（默认电话确认后代执行）/ 代面试官 -->
+        <div class="proxy-bar" v-if="store.myRole === 'recruiter' && ['negotiating','rescheduling'].includes(detail.status)">
+          <span class="muted">本次操作代表：</span>
+          <div class="seg">
+            <button :class="{ on: actingParty === 'candidate' }" @click="actingParty = 'candidate'">📞 代候选人</button>
+            <button :class="{ on: actingParty === 'interviewer' }" @click="actingParty = 'interviewer'">💬 代面试官</button>
+          </div>
+        </div>
         <div class="d-acts acts">
           <template v-if="['negotiating','rescheduling'].includes(detail.status)">
-            <!-- 面试官确认 -->
+            <!-- 面试官本人确认 -->
             <button v-if="store.myRole === 'interviewer' && detail.interviewer_id === store.currentUser?.id && !detail.int_confirmed"
               class="succ" @click="store.confirmAppointment(detail.id, 'interviewer')">✅ 我（面试官）确认</button>
             <!-- 招聘负责人代候选人确认 -->
-            <button v-if="store.myRole === 'recruiter' && !detail.cand_confirmed"
+            <button v-if="store.myRole === 'recruiter' && actingParty === 'candidate' && !detail.cand_confirmed"
               class="succ" @click="store.confirmAppointment(detail.id, 'candidate')">📞 已联系到候选人，代为确认</button>
+            <!-- 招聘负责人代面试官确认 -->
+            <button v-if="store.myRole === 'recruiter' && actingParty === 'interviewer' && !detail.int_confirmed"
+              class="succ" @click="store.confirmAppointment(detail.id, 'interviewer')">💬 已与面试官确认，代为确认</button>
             <button v-if="store.myRole !== 'hiring_manager'" class="warn" @click="openPropose">
               {{ detail.status === 'rescheduling' ? '🔁 再提一个时间' : '🔁 时间不合适，提议改期' }}
             </button>
             <button v-if="detail.status === 'rescheduling' && store.myRole !== 'hiring_manager'" class="ghost"
-              @click="store.rejectReschedule(detail.id, '不同意改期，维持原安排')">↩️ 拒绝改期（维持原时间）</button>
+              @click="openReject">↩️ 拒绝改期（维持原时间）</button>
             <button v-if="store.myRole !== 'hiring_manager'" class="danger" @click="openReason('decline')">🚫 婉拒本轮</button>
           </template>
 
@@ -562,10 +594,26 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
     <div class="modal" v-if="showReason" @click.self="showReason = null">
       <div class="modal-box card">
         <h3>{{ showReason === 'decline' ? '🚫 婉拒本轮预约' : '❌ 取消已确认预约' }}</h3>
+        <p class="muted" v-if="showReason === 'decline' && store.myRole === 'recruiter'">
+          将以「{{ actingParty === 'interviewer' ? '招聘负责人代面试官' : '招聘负责人代候选人' }}」身份婉拒，确认位与通知按该方联动。
+        </p>
         <textarea v-model="reasonText" rows="3" :placeholder="showReason === 'decline' ? '婉拒原因（必填，将通知对方，之后可重新协商）' : '取消原因（必填，将通知双方）'"></textarea>
         <div class="acts">
           <button class="danger" @click="submitReason">确认{{ showReason === 'decline' ? '婉拒' : '取消' }}</button>
           <button class="ghost" @click="showReason = null">返回</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 拒绝改期弹窗 -->
+    <div class="modal" v-if="showReject" @click.self="showReject = false">
+      <div class="modal-box card">
+        <h3>↩️ 拒绝改期（维持原时间）</h3>
+        <p class="muted">拒绝后预约回到已确认并维持原时间，双方时段重新占用。将以「{{ store.myRole === 'recruiter' ? (actingParty === 'interviewer' ? '招聘负责人代面试官' : '招聘负责人代候选人') : '面试官本人' }}」身份记录。</p>
+        <textarea v-model="rejectText" rows="3" placeholder="拒绝改期的说明（必填）"></textarea>
+        <div class="acts">
+          <button class="primary" @click="submitReject">确认拒绝改期</button>
+          <button class="ghost" @click="showReject = false">返回</button>
         </div>
       </div>
     </div>
@@ -578,6 +626,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
         <div class="form-grid one">
           <label><span>新开始时间 *</span><input type="datetime-local" v-model="rbf.start" /></label>
           <label><span>新结束时间 *</span><input type="datetime-local" v-model="rbf.end" /></label>
+          <label v-if="store.myRole === 'recruiter'"><span>重约代表方</span>
+            <select v-model="rbf.party"><option value="candidate">候选人方（已电话确认）</option><option value="interviewer">代面试官重约</option></select>
+          </label>
         </div>
         <div class="acts">
           <button class="primary" @click="submitRebook">发起重约</button>
@@ -697,6 +748,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
 .d-place { font-size: 12.5px; }
 .noshow-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border: 1px solid rgba(255,107,122,.45); background: rgba(255,107,122,.07); border-radius: 10px; padding: 10px 13px; margin-bottom: 12px; }
 .d-acts { margin-bottom: 14px; }
+.proxy-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 8px 12px;
+  background: rgba(91,140,255,.07); border: 1px solid rgba(91,140,255,.3); border-radius: 10px; }
+.proxy-bar .seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
 .judge { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; width: 100%; }
 .timeline { border-top: 1px solid var(--border); padding-top: 10px; }
 .timeline h4 { font-size: 13.5px; margin-bottom: 10px; }
