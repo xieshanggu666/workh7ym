@@ -6,7 +6,7 @@
 // - 缺席：结束 15 分钟仍未签到的已确认预约系统初判缺席，招聘负责人可裁定（候选人/面试官/双方缺席）后重约
 import express from 'express'
 import db, { ts } from './db.js'
-import { auditPassive } from './crisis.js'
+import { auditPassive, findActiveIncidentForApp } from './crisis.js'
 
 export const router = express.Router()
 
@@ -54,12 +54,13 @@ function notifyRole(role, type, title, body, appId = 0) {
   db.prepare(`INSERT INTO notifications(recipient_role,type,title,body,application_id,is_read,created_at)
               VALUES(?,?,?,?,?,0,?)`).run(role, type, title, body, appId, ts())
 }
-// 向「另一方」投递：候选人侧通知招聘负责人（代为转达），面试官侧通知本人角色；
-// 候选人操作的事件同时抄送招聘负责人，便于其跟进
+// 向「另一方」投递：候选人侧通知招聘负责人（代为转达），面试官侧通知本人角色。
+// 招聘负责人可代任一方操作：通知始终投递给被代方的相对方（候选人方动作→面试官；
+// 面试官方动作→招聘负责人转达候选人），因此不存在「操作人=相对方」的自通知场景。
+// 面试官本人操作时，候选人方通知给招聘负责人，由其转达。
 function notifyOther(appt, actorParty, type, title, body) {
   const role = ROLE_OF_PARTY[OTHER_PARTY[actorParty]]
   if (role) notifyRole(role, type, title, body, appt.application_id)
-  if (actorParty === 'candidate') notifyRole('recruiter', type, title, body, appt.application_id)
 }
 // 双方通知（已确认/取消/完成/缺席等结果性事件），跳过操作人自身角色避免自通知
 function notifyBoth(appt, actorRole, type, title, body) {
@@ -420,7 +421,9 @@ router.post('/appointments', wrap((req, res) => {
 
 // 内部：双方确认位齐备时落定（negotiating→confirmed / rescheduling→confirmed）
 // skipAudit：调用方（危机挂起后直接重约确认）已自行上链时，避免重复写审计条目
-function tryFullyConfirmed(appt, user, { skipAudit = false } = {}) {
+// party：由哪一方的确认补齐备位；给出时按「通知被代方的相对方」投递，避免代操作自通知；
+//        不给出（双方确认位预置直接成立的场景）则按操作人角色通知双方
+function tryFullyConfirmed(appt, user, { skipAudit = false, party = '' } = {}) {
   const isReschedule = appt.status === 'rescheduling'
   if (isReschedule) {
     // 改期双方确认：提议时间落定为正式时间
@@ -447,8 +450,9 @@ function tryFullyConfirmed(appt, user, { skipAudit = false } = {}) {
     })
   }
   syncInterview(appt)
-  // 危机处置中重约/恢复的预约在双方确认落定后：面试流程正式恢复，被动上链（resume 时已直接确认的场景除外）
-  if (!skipAudit && num(appt.incident_id)) {
+  // 危机处置中重约/恢复的预约在双方确认落定后：面试流程正式恢复，被动上链。
+  // 仅关联「处置中」事件才上链（resume 后事件可能已结案，incident_id 仅作来源留存）
+  if (!skipAudit && num(appt.incident_id) && findActiveIncidentForApp(appt.application_id)) {
     auditPassive({
       category: 'rollback', action: 'schedule.confirmed', actor: user, applicationId: appt.application_id,
       refType: 'appointment', refId: appt.id,
@@ -460,8 +464,13 @@ function tryFullyConfirmed(appt, user, { skipAudit = false } = {}) {
       }
     })
   }
-  notifyBoth(appt, user.role, 'sched_confirmed', '面试预约已确认',
-    `「${apptTitle(appt)}」已定于 ${formatLocal(appt.start_at)}（${appt.format}${appt.location ? ' · ' + appt.location : ''}）`)
+  if (party) {
+    notifyOther(appt, party, 'sched_confirmed', '面试预约已确认',
+      `「${apptTitle(appt)}」已定于 ${formatLocal(appt.start_at)}（${appt.format}${appt.location ? ' · ' + appt.location : ''}）`)
+  } else {
+    notifyBoth(appt, user.role, 'sched_confirmed', '面试预约已确认',
+      `「${apptTitle(appt)}」已定于 ${formatLocal(appt.start_at)}（${appt.format}${appt.location ? ' · ' + appt.location : ''}）`)
+  }
 }
 
 // 单方确认
@@ -492,7 +501,7 @@ router.post('/appointments/:id/confirm', wrap((req, res) => {
       content: (party === 'interviewer' ? '面试官' : '候选人') + '已确认该时间'
     })
     if (appt.cand_confirmed && appt.int_confirmed) {
-      tryFullyConfirmed(appt, user)
+      tryFullyConfirmed(appt, user, { party })
     } else {
       const waiting = appt.cand_confirmed ? '面试官' : '候选人'
       notifyOther(appt, party, 'sched_partial', '预约一方已确认',
@@ -528,6 +537,8 @@ router.post('/appointments/:id/propose', wrap((req, res) => {
         .run(start, end, party === 'candidate' ? 1 : 0, party === 'interviewer' ? 1 : 0, ts(), appt.id)
       Object.assign(appt, getAppt(appt.id))
       addMessage(appt.id, { kind: 'propose', party, actor: user, start, end, content: reason || '更新了提议时间' })
+      // 提议时间即面试页展示的待确认时间，保持 interviews 表同步
+      syncInterview(appt)
     } else {
       // confirmed / rescheduling：原时间保留，提议放入 pending；进入/保持改期协商
       releaseSlots(appt.id)
@@ -562,6 +573,10 @@ router.post('/appointments/:id/reject-reschedule', wrap((req, res) => {
     assertActorOnAppt(user, appt, party)
     const note = String(b.note || '')
     if (!note.trim()) badRequest('请填写拒绝改期的说明', 'note_required')
+    // 改期协商期间原时段已释放，可能已被其他预约占用；拒绝改期前必须重新校验原时间，
+    // 冲突则拒绝回退（维持 rescheduling），由双方另行提议，避免确认位/时段/状态错配
+    assertNoConflict({ applicationId: appt.application_id, interviewerId: appt.interviewer_id,
+      start: appt.start_at, end: appt.end_at, excludeApptId: appt.id })
     db.prepare(`UPDATE appointments SET status='confirmed',pending_start='',pending_end='',pending_format='',pending_location='',
                 pending_by_party='',cand_confirmed=1,int_confirmed=1,reminded_24h=0,reminded_1h=0,checkin_flagged=0,
                 updated_at=?,version=version+1 WHERE id=?`)
@@ -590,7 +605,9 @@ router.post('/appointments/:id/decline', wrap((req, res) => {
     assertActorOnAppt(user, appt, party)
     const reason = String(b.reason || '')
     if (!reason.trim()) badRequest('请填写婉拒原因', 'reason_required')
-    db.prepare(`UPDATE appointments SET status='declined',final_result='declined',pending_start='',pending_end='',
+    db.prepare(`UPDATE appointments SET status='declined',final_result='declined',
+                pending_start='',pending_end='',pending_format='',pending_location='',pending_by_party='',
+                cand_confirmed=0,int_confirmed=0,reminded_24h=0,reminded_1h=0,checkin_flagged=0,
                 updated_at=?,completed_at=?,version=version+1 WHERE id=?`).run(ts(), ts(), appt.id)
     Object.assign(appt, getAppt(appt.id))
     releaseSlots(appt.id)
@@ -643,8 +660,15 @@ router.post('/appointments/:id/resume', wrap((req, res) => {
     const crisisIncidentId = num(appt.incident_id)
     const { start, end } = readInterval(b)
     assertNoConflict({ applicationId: appt.application_id, interviewerId: appt.interviewer_id, start, end, excludeApptId: appt.id })
-    const candBit = user.role === 'interviewer' ? (b.cand_confirmed === true ? 1 : 0) : 1
-    const intBit = user.role === 'interviewer' ? 1 : (b.int_confirmed === true ? 1 : 0)
+    // 代操作方在发起重协时视为该方已电话确认，确认位置给被代方；
+    // 招聘负责人若已同时与另一方电话确认，可预置对方确认位直接成立
+    const party = resolveParty(user, b)
+    let candBit = party === 'candidate' ? 1 : 0
+    let intBit = party === 'interviewer' ? 1 : 0
+    if (user.role === 'recruiter') {
+      if (b.cand_confirmed === true) candBit = 1
+      if (b.int_confirmed === true) intBit = 1
+    }
     const confirmed = candBit && intBit
     db.prepare(`UPDATE appointments SET status=?,start_at=?,end_at=?,pending_start='',pending_end='',pending_format='',pending_location='',
                 pending_by_party='',cand_confirmed=?,int_confirmed=?,final_result='',checkin_flagged=0,reminded_24h=0,reminded_1h=0,
@@ -655,15 +679,15 @@ router.post('/appointments/:id/resume', wrap((req, res) => {
         String(b.format || ''), String(b.location || ''), confirmed ? ts() : '', ts(), appt.id)
     Object.assign(appt, getAppt(appt.id))
     addMessage(appt.id, {
-      kind: wasCrisisSuspended ? 'crisis_resume' : 'resume', party: user.role === 'interviewer' ? 'interviewer' : 'recruiter',
+      kind: wasCrisisSuspended ? 'crisis_resume' : 'resume', party,
       actor: user, start, end,
       content: wasCrisisSuspended
         ? `危机挂起后恢复协商：${formatLocal(start)}（重约恢复后续面试流程）`
         : `重新发起预约协商：${formatLocal(start)}`
     })
     syncInterview(appt)
-    // 危机挂起的预约在原单上重约恢复：若关联事件仍在处置中，同事务被动追加审计条目
-    if (wasCrisisSuspended && crisisIncidentId) {
+    // 危机挂起的预约在原单上重约恢复：仅当关联事件仍在处置中，同事务被动追加审计条目
+    if (wasCrisisSuspended && crisisIncidentId && findActiveIncidentForApp(appt.application_id)) {
       auditPassive({
         category: 'rollback', action: 'schedule.rebook', actor: user, applicationId: appt.application_id,
         refType: 'appointment', refId: appt.id,
@@ -681,7 +705,7 @@ router.post('/appointments/:id/resume', wrap((req, res) => {
       notifyBoth(appt, user.role, 'sched_confirmed', '面试预约已重新确认',
         `「${apptTitle(appt)}」已定于 ${formatLocal(start)}`)
     } else {
-      notifyOther(appt, user.role === 'interviewer' ? 'interviewer' : 'candidate', 'sched_proposed', '预约已重新发起，待确认',
+      notifyOther(appt, party, 'sched_proposed', '预约已重新发起，待确认',
         `「${apptTitle(appt)}」新提议 ${formatLocal(start)}，待确认`)
     }
     return { ok: true, status: appt.status }
@@ -700,7 +724,7 @@ router.post('/appointments/:id/rebook', wrap((req, res) => {
     if (user.role === 'interviewer' && String(appt.interviewer_id) !== String(user.id)) forbidden('只能处理本人的预约', 'not_your_appointment')
     const { start, end } = readInterval(b)
     assertNoConflict({ applicationId: appt.application_id, interviewerId: appt.interviewer_id, start, end, excludeApptId: appt.id })
-    const party = user.role === 'interviewer' ? 'interviewer' : 'candidate'
+    const party = resolveParty(user, b)
     const keptResult = appt.final_result
     db.prepare(`UPDATE appointments SET status='negotiating',start_at=?,end_at=?,pending_start='',pending_end='',
                 cand_confirmed=?,int_confirmed=?,final_result='',checkin_flagged=0,reminded_24h=0,reminded_1h=0,
@@ -712,16 +736,18 @@ router.post('/appointments/:id/rebook', wrap((req, res) => {
       content: `缺席后重新约期：${formatLocal(start)}，待对方确认`
     })
     syncInterview(appt)
-    // 关联处置中危机事件的应聘：缺席重约同样意味着面试流程重新启动，被动上链
-    auditPassive({
-      category: 'rollback', action: 'schedule.rebook', actor: user, applicationId: appt.application_id,
-      refType: 'appointment', refId: appt.id,
-      summary: `缺席预约 #${appt.id} 已重新约期（保留缺席记录），待确认后恢复：${formatLocal(start)}`,
-      detail: {
-        appointment_id: appt.id, round: appt.round, start_at: start, end_at: end,
-        kept_result: keptResult, by: { id: user.id, name: user.name, role: user.role }
-      }
-    })
+    // 仅关联处置中危机事件的应聘才被动上链：缺席重约意味着面试流程重新启动
+    if (findActiveIncidentForApp(appt.application_id)) {
+      auditPassive({
+        category: 'rollback', action: 'schedule.rebook', actor: user, applicationId: appt.application_id,
+        refType: 'appointment', refId: appt.id,
+        summary: `缺席预约 #${appt.id} 已重新约期（保留缺席记录），待确认后恢复：${formatLocal(start)}`,
+        detail: {
+          appointment_id: appt.id, round: appt.round, start_at: start, end_at: end,
+          kept_result: keptResult, by_party: party, by: { id: user.id, name: user.name, role: user.role }
+        }
+      })
+    }
     notifyOther(appt, party, 'sched_rebooked', '缺席后已重新约期，待确认',
       `「${apptTitle(appt)}」缺席记录保留，新提议 ${formatLocal(start)}，请确认`)
     return { ok: true, status: 'negotiating' }

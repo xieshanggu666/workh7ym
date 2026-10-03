@@ -224,18 +224,28 @@ function applySuggestion(s) {
 
 // ---------------- 终态（婉拒/取消）后重新协商 ----------------
 const showResume = ref(false)
-const rsf = ref(blankPropose())
+const rsf = ref(blankResume())
+function blankResume() {
+  const b = blankPropose()
+  return { ...b, other_confirmed: false }
+}
 function openResume() {
-  rsf.value = blankPropose()
+  rsf.value = blankResume()
   rsf.value.party = store.myRole === 'interviewer' ? 'interviewer' : 'candidate'
   showResume.value = true
 }
 async function submitResume() {
-  const r = await store.resumeAppointment(detail.value.id, {
+  const payload = {
     start_at: new Date(rsf.value.start).toISOString(),
     end_at: new Date(rsf.value.end).toISOString(),
     party: rsf.value.party
-  })
+  }
+  // 招聘负责人已同时与另一方电话确认：预置对方确认位，重协即成立
+  if (store.myRole === 'recruiter' && rsf.value.other_confirmed) {
+    if (rsf.value.party === 'candidate') payload.int_confirmed = true
+    else payload.cand_confirmed = true
+  }
+  const r = await store.resumeAppointment(detail.value.id, payload)
   if (r) showResume.value = false
 }
 
@@ -479,6 +489,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
             <!-- 招聘负责人代候选人确认 -->
             <button v-if="store.myRole === 'recruiter' && !detail.cand_confirmed"
               class="succ" @click="store.confirmAppointment(detail.id, 'candidate')">📞 已联系到候选人，代为确认</button>
+            <!-- 招聘负责人代面试官确认（电话确认后代操作） -->
+            <button v-if="store.myRole === 'recruiter' && !detail.int_confirmed"
+              class="succ" @click="store.confirmAppointment(detail.id, 'interviewer')">📞 已与面试官确认，代为确认</button>
             <button v-if="store.myRole !== 'hiring_manager'" class="warn" @click="openPropose">
               {{ detail.status === 'rescheduling' ? '🔁 再提一个时间' : '🔁 时间不合适，提议改期' }}
             </button>
@@ -578,6 +591,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
         <div class="form-grid one">
           <label><span>新开始时间 *</span><input type="datetime-local" v-model="rbf.start" /></label>
           <label><span>新结束时间 *</span><input type="datetime-local" v-model="rbf.end" /></label>
+          <label v-if="store.myRole === 'recruiter'"><span>重约代表方</span>
+            <select v-model="rbf.party"><option value="candidate">候选人方（已电话确认）</option><option value="interviewer">代面试官重约</option></select>
+          </label>
         </div>
         <div class="acts">
           <button class="primary" @click="submitRebook">发起重约</button>
@@ -596,6 +612,9 @@ const PARTY_LABEL = { candidate: '候选人方', interviewer: '面试官', recru
           <label><span>结束时间 *</span><input type="datetime-local" v-model="rsf.end" /></label>
           <label v-if="store.myRole === 'recruiter'"><span>提议代表方</span>
             <select v-model="rsf.party"><option value="candidate">候选人方（已电话确认）</option><option value="interviewer">代面试官提议</option></select>
+          </label>
+          <label v-if="store.myRole === 'recruiter'"><span>&nbsp;</span>
+            <label class="ck"><input type="checkbox" v-model="rsf.other_confirmed" /> 已同时与另一方电话确认（重协即直接成立）</label>
           </label>
         </div>
         <div class="acts">
